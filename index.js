@@ -105,87 +105,105 @@ async function getTokenHolders(mint) {
 }
 
 /**
- * Get recent Pump.fun transactions and extract token mints
+ * Get Pump.fun token mints, paginating back to find older ones
  */
 async function getPumpFunGraduations() {
-  console.log('📡 Fetching recent Pump.fun transactions...');
+  console.log('📡 Fetching Pump.fun transactions (paginating for older data)...');
 
-  const signatures = await rpcCall('getSignaturesForAddress', [
-    PUMP_FUN_PROGRAM,
-    { limit: 100 }  // Increased to get older transactions
-  ]);
-
-  console.log(`   Found ${signatures.length} recent transactions`);
-
-  const tokenMints = [];
   const now = Date.now() / 1000;
   const seenMints = new Set();
-  let debugCount = 0;
+  const tokenMints = [];
+  let lastSignature = undefined;
+  let totalTxChecked = 0;
+  let oldestAge = 0;
 
-  for (const sig of signatures.slice(0, 40)) {
-    try {
-      const tx = await rpcCall('getTransaction', [
-        sig.signature,
-        { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }
-      ]);
-
-      if (!tx || !tx.meta) {
-        continue;
-      }
-
-      const postBalances = tx.meta?.postTokenBalances || [];
-      const preBalances = tx.meta?.preTokenBalances || [];
-      const allBalances = [...postBalances, ...preBalances];
-
-      // Debug: show first few transactions
-      if (debugCount < 3) {
-        const ageMin = (now - tx.blockTime) / 60;
-        console.log(`   DEBUG tx ${debugCount + 1}: ${allBalances.length} token balances, age: ${ageMin.toFixed(1)} min`);
-        debugCount++;
-      }
-
-      for (const balance of allBalances) {
-        const mint = balance.mint;
-
-        if (!mint ||
-            mint === 'So11111111111111111111111111111111111111112' ||
-            seenMints.has(mint)) {
-          continue;
-        }
-
-        seenMints.add(mint);
-
-        const ageSeconds = now - tx.blockTime;
-        const ageMinutes = ageSeconds / 60;
-
-        // Collect ALL mints first, filter later
-        tokenMints.push({
-          mint: mint,
-          signature: sig.signature,
-          blockTime: tx.blockTime,
-          ageMinutes: Math.round(ageMinutes)
-        });
-      }
-    } catch (error) {
-      // Skip failed transactions
+  // Paginate until we find transactions old enough
+  for (let page = 0; page < 5; page++) {
+    const params = { limit: 100 };
+    if (lastSignature) {
+      params.before = lastSignature;
     }
 
-    await new Promise(r => setTimeout(r, 50));
+    const signatures = await rpcCall('getSignaturesForAddress', [
+      PUMP_FUN_PROGRAM,
+      params
+    ]);
+
+    if (signatures.length === 0) break;
+
+    console.log(`   Page ${page + 1}: fetched ${signatures.length} signatures`);
+
+    // Check age of last signature in batch
+    const lastSig = signatures[signatures.length - 1];
+    lastSignature = lastSig.signature;
+
+    // Get a sample transaction to check age
+    const sampleTx = await rpcCall('getTransaction', [
+      lastSig.signature,
+      { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }
+    ]);
+
+    if (sampleTx) {
+      oldestAge = (now - sampleTx.blockTime) / 60;
+      console.log(`   Oldest tx in batch: ${oldestAge.toFixed(1)} min ago`);
+    }
+
+    // Process transactions in this batch
+    for (const sig of signatures.slice(0, 20)) {
+      try {
+        const tx = await rpcCall('getTransaction', [
+          sig.signature,
+          { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }
+        ]);
+
+        if (!tx || !tx.meta) continue;
+        totalTxChecked++;
+
+        const allBalances = [
+          ...(tx.meta.postTokenBalances || []),
+          ...(tx.meta.preTokenBalances || [])
+        ];
+
+        for (const balance of allBalances) {
+          const mint = balance.mint;
+
+          if (!mint ||
+              mint === 'So11111111111111111111111111111111111111112' ||
+              seenMints.has(mint)) {
+            continue;
+          }
+
+          seenMints.add(mint);
+
+          const ageMinutes = (now - tx.blockTime) / 60;
+
+          if (ageMinutes >= MIN_AGE_MINUTES) {
+            tokenMints.push({
+              mint,
+              signature: sig.signature,
+              blockTime: tx.blockTime,
+              ageMinutes: Math.round(ageMinutes)
+            });
+          }
+        }
+      } catch (error) {
+        // Skip
+      }
+
+      await new Promise(r => setTimeout(r, 50));
+    }
+
+    // Stop if we've gone back far enough
+    if (oldestAge >= MIN_AGE_MINUTES * 2) {
+      console.log(`   Reached ${oldestAge.toFixed(0)} min ago, stopping pagination`);
+      break;
+    }
   }
 
-  console.log(`   Total unique mints found: ${tokenMints.length}`);
+  console.log(`   Checked ${totalTxChecked} transactions total`);
+  console.log(`   Found ${tokenMints.length} mints older than ${MIN_AGE_MINUTES} min`);
 
-  // Show age distribution
-  if (tokenMints.length > 0) {
-    const ages = tokenMints.map(t => t.ageMinutes);
-    console.log(`   Age range: ${Math.min(...ages)} - ${Math.max(...ages)} minutes`);
-  }
-
-  // NOW filter by age
-  const filtered = tokenMints.filter(t => t.ageMinutes >= MIN_AGE_MINUTES);
-  console.log(`   After age filter (>= ${MIN_AGE_MINUTES}min): ${filtered.length}`);
-
-  return filtered;
+  return tokenMints;
 }
 
 /**
@@ -407,3 +425,6 @@ process.on('SIGINT', () => {
 
 // Run
 main().catch(console.error);
+
+// Keep process alive
+setInterval(() => {}, 1 << 30);
