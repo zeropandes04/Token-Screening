@@ -1,430 +1,253 @@
 /**
- * Pump.fun Survivor Scanner
+ * Pump.fun Graduation Listener
  * 
- * Polls Helius RPC to find Pump.fun tokens that:
- * - Graduated (migrated to Raydium)
- * - Age > 30 minutes
- * - Holders > 100
+ * Connects to PumpPortal WebSocket and listens for token migrations
+ * (graduations) to Raydium. Only ~1% of tokens graduate, so this
+ * filters out 99% of noise automatically.
  * 
- * Outputs top 5 survivors every polling interval.
+ * When a graduation occurs, sends the CA to n8n for safety checks.
  */
 
-import 'dotenv/config';
+import WebSocket from 'ws';
 import fetch from 'node-fetch';
+import 'dotenv/config';
 
 // Configuration
-const HELIUS_RPC = process.env.HELIUS_RPC || 'https://mainnet.helius-rpc.com/?api-key=YOUR_KEY';
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || '';
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '600000'); // 10 minutes default
-const MIN_HOLDERS = parseInt(process.env.MIN_HOLDERS || '100');
-const MIN_AGE_MINUTES = parseInt(process.env.MIN_AGE_MINUTES || '30');
+const PUMPPORTAL_WS = 'wss://pumpportal.fun/api/data';
 
-// Solana Program IDs
-const PUMP_FUN_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
-const RAYDIUM_AMM = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
-
-// Track credits usage
-let creditsUsed = 0;
-let pollCount = 0;
+// Track sent tokens to avoid duplicates
+const sentTokens = new Set();
+let reconnectDelay = 1000;
+let totalGraduations = 0;
+let totalSent = 0;
 
 /**
- * Make RPC call to Helius
+ * Send graduated token to n8n webhook
  */
-async function rpcCall(method, params = []) {
-  const response = await fetch(HELIUS_RPC, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: Date.now(),
-      method,
-      params
-    })
-  });
-  
-  const data = await response.json();
-  creditsUsed += 1; // Approximate - actual varies by method
-  
-  if (data.error) {
-    throw new Error(`RPC Error: ${data.error.message}`);
+async function sendToN8n(tokenData) {
+  if (!N8N_WEBHOOK_URL) {
+    console.log('   ⚠️  N8N_WEBHOOK_URL not set');
+    return false;
   }
-  
-  return data.result;
-}
 
-/**
- * Helius DAS API call for asset metadata
- */
-async function getAsset(mint) {
-  const response = await fetch(HELIUS_RPC, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: Date.now(),
-      method: 'getAsset',
-      params: { id: mint }
-    })
-  });
-  
-  const data = await response.json();
-  creditsUsed += 10; // DAS calls cost more
-  
-  return data.result;
-}
+  // Avoid duplicates
+  if (sentTokens.has(tokenData.ca)) {
+    console.log(`   ⏭️  Already sent: ${tokenData.ca.slice(0, 8)}...`);
+    return false;
+  }
 
-/**
- * Get token holders count using Helius DAS
- */
-async function getTokenHolders(mint) {
   try {
-    const response = await fetch(HELIUS_RPC, {
+    const response = await fetch(N8N_WEBHOOK_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: Date.now(),
-        method: 'getTokenAccounts',
-        params: {
-          mint: mint,
-          limit: 1,
-          options: { showZeroBalance: false }
-        }
-      })
+      body: JSON.stringify(tokenData)
     });
-    
-    const data = await response.json();
-    creditsUsed += 10;
-    
-    // The total field gives us holder count
-    return data.result?.total || 0;
+
+    if (response.ok) {
+      sentTokens.add(tokenData.ca);
+      totalSent++;
+      console.log(`   ✅ Sent to n8n: ${tokenData.symbol || tokenData.ca.slice(0, 8)}...`);
+      return true;
+    } else {
+      console.log(`   ⚠️  n8n returned ${response.status}`);
+      return false;
+    }
   } catch (error) {
-    console.error(`Error getting holders for ${mint}:`, error.message);
-    return 0;
-  }
-}
-
-/**
- * Get Pump.fun token mints, paginating back to find older ones
- */
-async function getPumpFunGraduations() {
-  console.log('📡 Fetching Pump.fun transactions (paginating for older data)...');
-
-  const now = Date.now() / 1000;
-  const seenMints = new Set();
-  const tokenMints = [];
-  let lastSignature = undefined;
-  let totalTxChecked = 0;
-  let oldestAge = 0;
-
-  // Paginate until we find transactions old enough
-  for (let page = 0; page < 5; page++) {
-    const params = { limit: 100 };
-    if (lastSignature) {
-      params.before = lastSignature;
-    }
-
-    const signatures = await rpcCall('getSignaturesForAddress', [
-      PUMP_FUN_PROGRAM,
-      params
-    ]);
-
-    if (signatures.length === 0) break;
-
-    console.log(`   Page ${page + 1}: fetched ${signatures.length} signatures`);
-
-    // Check age of last signature in batch
-    const lastSig = signatures[signatures.length - 1];
-    lastSignature = lastSig.signature;
-
-    // Get a sample transaction to check age
-    const sampleTx = await rpcCall('getTransaction', [
-      lastSig.signature,
-      { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }
-    ]);
-
-    if (sampleTx) {
-      oldestAge = (now - sampleTx.blockTime) / 60;
-      console.log(`   Oldest tx in batch: ${oldestAge.toFixed(1)} min ago`);
-    }
-
-    // Process transactions in this batch
-    for (const sig of signatures.slice(0, 20)) {
-      try {
-        const tx = await rpcCall('getTransaction', [
-          sig.signature,
-          { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }
-        ]);
-
-        if (!tx || !tx.meta) continue;
-        totalTxChecked++;
-
-        const allBalances = [
-          ...(tx.meta.postTokenBalances || []),
-          ...(tx.meta.preTokenBalances || [])
-        ];
-
-        for (const balance of allBalances) {
-          const mint = balance.mint;
-
-          if (!mint ||
-              mint === 'So11111111111111111111111111111111111111112' ||
-              seenMints.has(mint)) {
-            continue;
-          }
-
-          seenMints.add(mint);
-
-          const ageMinutes = (now - tx.blockTime) / 60;
-
-          if (ageMinutes >= MIN_AGE_MINUTES) {
-            tokenMints.push({
-              mint,
-              signature: sig.signature,
-              blockTime: tx.blockTime,
-              ageMinutes: Math.round(ageMinutes)
-            });
-          }
-        }
-      } catch (error) {
-        // Skip
-      }
-
-      await new Promise(r => setTimeout(r, 50));
-    }
-
-    // Stop if we've gone back far enough
-    if (oldestAge >= MIN_AGE_MINUTES * 2) {
-      console.log(`   Reached ${oldestAge.toFixed(0)} min ago, stopping pagination`);
-      break;
-    }
-  }
-
-  console.log(`   Checked ${totalTxChecked} transactions total`);
-  console.log(`   Found ${tokenMints.length} mints older than ${MIN_AGE_MINUTES} min`);
-
-  return tokenMints;
-}
-
-/**
- * Check if mint has a Raydium pool
- */
-async function hasRaydiumPool(mint) {
-  try {
-    // Get recent Raydium transactions and look for this mint
-    const signatures = await rpcCall('getSignaturesForAddress', [
-      RAYDIUM_AMM,
-      { limit: 20 }
-    ]);
-    
-    for (const sig of signatures.slice(0, 5)) {
-      const tx = await rpcCall('getTransaction', [
-        sig.signature,
-        { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }
-      ]);
-      
-      if (!tx) continue;
-      
-      const balances = tx.meta?.postTokenBalances || [];
-      if (balances.some(b => b.mint === mint)) {
-        return true;
-      }
-    }
-    
-    return false;
-  } catch (error) {
+    console.error(`   ❌ Failed to send: ${error.message}`);
     return false;
   }
 }
 
 /**
- * Enrich mint with metadata and holder count
+ * Parse graduation event from PumpPortal
  */
-async function enrichMint(mintData) {
+function parseGraduationEvent(data) {
   try {
-    // Get holder count
-    const holders = await getTokenHolders(mintData.mint);
+    // PumpPortal migration event structure
+    const ca = data.mint || data.token || data.tokenAddress || data.ca;
     
-    if (holders < MIN_HOLDERS) {
-      return null; // Filter out low holder tokens
+    if (!ca) {
+      console.log('   ⚠️  No CA found in event');
+      return null;
     }
-    
-    // Get asset metadata
-    let asset = null;
-    try {
-      asset = await getAsset(mintData.mint);
-    } catch (e) {
-      // Asset API might not have all tokens
-    }
-    
+
     return {
-      mint: mintData.mint,
-      symbol: asset?.content?.metadata?.symbol || 'UNKNOWN',
-      name: asset?.content?.metadata?.name || '',
-      holders: holders,
-      ageMinutes: mintData.ageMinutes,
-      signature: mintData.signature,
-      blockTime: mintData.blockTime,
-      // Links for manual trading
-      links: {
-        dexscreener: `https://dexscreener.com/solana/${mintData.mint}`,
-        birdeye: `https://birdeye.so/token/${mintData.mint}?chain=solana`,
-        rugcheck: `https://rugcheck.xyz/tokens/${mintData.mint}`,
-        gmgn: `https://gmgn.ai/sol/token/${mintData.mint}`
-      }
+      // Core fields for n8n
+      ca: ca,
+      symbol: data.symbol || data.name || 'UNKNOWN',
+      name: data.name || '',
+      
+      // Migration data if available
+      liquidity_usd: data.vSolInBondingCurve ? data.vSolInBondingCurve * 200 : 0, // Rough estimate
+      market_cap: data.marketCapSol ? data.marketCapSol * 200 : 0,
+      
+      // Event metadata
+      event_type: 'graduation',
+      dex: 'raydium',
+      source: 'pumpportal_websocket',
+      received_at: new Date().toISOString(),
+      
+      // Raw data for debugging
+      raw_event: data
     };
   } catch (error) {
-    console.error(`   Error enriching ${mintData.mint.slice(0, 8)}...: ${error.message}`);
+    console.error(`   Parse error: ${error.message}`);
     return null;
   }
 }
 
 /**
- * Send survivors to n8n webhook
+ * Handle incoming WebSocket message
  */
-async function sendToN8n(survivors) {
-  if (!N8N_WEBHOOK_URL) {
-    console.log('   ⚠️  N8N_WEBHOOK_URL not set, skipping webhook');
-    return;
-  }
-  
+async function handleMessage(message) {
   try {
-    for (const survivor of survivors) {
-      await fetch(N8N_WEBHOOK_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...survivor,
-          source: 'helius_pump_scanner',
-          detected_at: new Date().toISOString()
-        })
-      });
-      console.log(`   ✅ Sent to n8n: ${survivor.symbol} (${survivor.mint.slice(0, 8)}...)`);
-    }
-  } catch (error) {
-    console.error(`   ❌ Failed to send to n8n: ${error.message}`);
-  }
-}
-
-/**
- * Format survivor for console output
- */
-function formatSurvivor(s, rank) {
-  return `
-  #${rank} ${s.symbol} (${s.name || 'No name'})
-     Mint: ${s.mint}
-     Holders: ${s.holders}
-     Age: ${s.ageMinutes} minutes
-     🔗 ${s.links.dexscreener}
-`;
-}
-
-/**
- * Main polling function
- */
-async function poll() {
-  pollCount++;
-  const startCredits = creditsUsed;
-  
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`🔍 POLL #${pollCount} - ${new Date().toISOString()}`);
-  console.log(`${'='.repeat(60)}`);
-  
-  try {
-    // Step 1: Get recent Pump.fun graduations
-    const graduations = await getPumpFunGraduations();
+    const data = JSON.parse(message);
     
-    if (graduations.length === 0) {
-      console.log('   No graduations found this poll');
-      return;
+    // Debug: log message type
+    const msgType = data.txType || data.type || data.event || 'unknown';
+    
+    // Check for migration/graduation events
+    const isMigration = 
+      msgType === 'migrate' ||
+      msgType === 'migration' ||
+      msgType === 'graduated' ||
+      msgType === 'create' && data.pool === 'raydium' ||
+      data.migrated === true ||
+      (data.txType === 'create' && data.pool);
+    
+    if (isMigration) {
+      totalGraduations++;
+      console.log(`\n🎓 GRADUATION #${totalGraduations} detected!`);
+      console.log(`   Type: ${msgType}`);
+      console.log(`   Data: ${JSON.stringify(data).slice(0, 200)}...`);
+      
+      const tokenData = parseGraduationEvent(data);
+      if (tokenData) {
+        await sendToN8n(tokenData);
+      }
     }
     
-    // Step 2: Enrich with holder data and filter
-    console.log(`\n📊 Enriching ${graduations.length} mints with holder data...`);
-    const enrichedPromises = graduations.map(g => enrichMint(g));
-    const enriched = (await Promise.all(enrichedPromises)).filter(Boolean);
-    
-    console.log(`   ${enriched.length} mints passed holder filter (>= ${MIN_HOLDERS})`);
-    
-    if (enriched.length === 0) {
-      console.log('   No survivors this poll');
-      return;
+    // Also check for trade events with "complete" bonding curve
+    if (data.txType === 'trade' && data.bondingCurveComplete === true) {
+      totalGraduations++;
+      console.log(`\n🎓 GRADUATION #${totalGraduations} (bonding complete)!`);
+      
+      const tokenData = parseGraduationEvent(data);
+      if (tokenData) {
+        await sendToN8n(tokenData);
+      }
     }
-    
-    // Step 3: Sort by holders and take top 5
-    const survivors = enriched
-      .sort((a, b) => b.holders - a.holders)
-      .slice(0, 5);
-    
-    // Step 4: Output results
-    console.log(`\n🏆 TOP ${survivors.length} SURVIVORS:`);
-    survivors.forEach((s, i) => console.log(formatSurvivor(s, i + 1)));
-    
-    // Step 5: Send to n8n
-    await sendToN8n(survivors);
     
   } catch (error) {
-    console.error(`\n❌ Poll error: ${error.message}`);
-  } finally {
-    const pollCredits = creditsUsed - startCredits;
-    console.log(`\n📈 Credits used this poll: ~${pollCredits}`);
-    console.log(`📈 Total credits used: ~${creditsUsed}`);
-    console.log(`⏰ Next poll in ${POLL_INTERVAL_MS / 60000} minutes`);
+    // Not JSON or parse error - ignore
   }
 }
 
 /**
- * Startup and main loop
+ * Connect to PumpPortal WebSocket
+ */
+function connect() {
+  console.log(`🔌 Connecting to ${PUMPPORTAL_WS}...`);
+  
+  const ws = new WebSocket(PUMPPORTAL_WS);
+  
+  ws.on('open', () => {
+    console.log('✅ Connected to PumpPortal WebSocket');
+    reconnectDelay = 1000; // Reset delay on successful connection
+    
+    // Subscribe to migration events
+    // Method 1: Subscribe to new token trades (includes graduations)
+    ws.send(JSON.stringify({
+      method: 'subscribeNewToken'
+    }));
+    
+    // Method 2: Subscribe to account trades for migration account
+    ws.send(JSON.stringify({
+      method: 'subscribeAccountTrade',
+      keys: ['39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg'] // Pump.fun migration account
+    }));
+    
+    console.log('📡 Subscribed to graduation events');
+    console.log('👀 Listening for migrations...\n');
+  });
+  
+  ws.on('message', (message) => {
+    handleMessage(message.toString());
+  });
+  
+  ws.on('error', (error) => {
+    console.error(`❌ WebSocket error: ${error.message}`);
+  });
+  
+  ws.on('close', (code, reason) => {
+    console.log(`\n🔌 Connection closed: ${code} ${reason}`);
+    console.log(`   Reconnecting in ${reconnectDelay / 1000}s...`);
+    
+    setTimeout(() => {
+      reconnectDelay = Math.min(reconnectDelay * 2, 60000); // Max 60s
+      connect();
+    }, reconnectDelay);
+  });
+  
+  // Heartbeat to keep connection alive
+  const heartbeat = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+    } else {
+      clearInterval(heartbeat);
+    }
+  }, 30000);
+  
+  return ws;
+}
+
+/**
+ * Main entry point
  */
 async function main() {
   console.log(`
 ╔════════════════════════════════════════════════════════════╗
-║         PUMP.FUN SURVIVOR SCANNER                          ║
-║         Powered by Helius RPC                              ║
+║         PUMP.FUN GRADUATION LISTENER                       ║
+║         Real-time WebSocket via PumpPortal                 ║
 ╚════════════════════════════════════════════════════════════╝
 
 Configuration:
-  - Helius RPC: ${HELIUS_RPC.replace(/api-key=.*/, 'api-key=***')}
-  - n8n Webhook: ${N8N_WEBHOOK_URL ? N8N_WEBHOOK_URL.slice(0, 40) + '...' : 'Not set'}
-  - Poll Interval: ${POLL_INTERVAL_MS / 60000} minutes
-  - Min Holders: ${MIN_HOLDERS}
-  - Min Age: ${MIN_AGE_MINUTES} minutes
+  - PumpPortal WS: ${PUMPPORTAL_WS}
+  - n8n Webhook: ${N8N_WEBHOOK_URL ? N8N_WEBHOOK_URL.slice(0, 50) + '...' : 'NOT SET'}
+
+Why this works:
+  - Only ~1% of Pump.fun tokens graduate to Raydium
+  - We listen ONLY for graduation events (not all 24k daily launches)
+  - Real-time push, not polling
+  - 99% noise reduction built-in
 `);
 
-  // Validate Helius key
-  if (HELIUS_RPC.includes('YOUR_KEY')) {
-    console.error('❌ Please set HELIUS_RPC environment variable with your API key');
-    console.error('   Get free key at: https://dev.helius.xyz/');
+  if (!N8N_WEBHOOK_URL) {
+    console.error('❌ N8N_WEBHOOK_URL environment variable is required');
     process.exit(1);
   }
 
-  // Run first poll immediately
-  await poll();
+  // Connect
+  connect();
   
-  // Schedule recurring polls
-  setInterval(poll, POLL_INTERVAL_MS);
-
-  // Keep process alive
-  process.stdin.resume();
-
-  console.log('\n👀 Scanner running. Press Ctrl+C to stop.\n');
+  // Stats every 5 minutes
+  setInterval(() => {
+    console.log(`\n📊 Stats: ${totalGraduations} graduations seen, ${totalSent} sent to n8n`);
+  }, 300000);
 }
 
-// Handle graceful shutdown
+// Shutdown handlers
 process.on('SIGTERM', () => {
   console.log('\n👋 Shutting down...');
-  console.log(`📈 Final credits used: ~${creditsUsed}`);
+  console.log(`📊 Final: ${totalGraduations} graduations, ${totalSent} sent`);
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
   console.log('\n👋 Shutting down...');
-  console.log(`📈 Final credits used: ~${creditsUsed}`);
+  console.log(`📊 Final: ${totalGraduations} graduations, ${totalSent} sent`);
   process.exit(0);
 });
 
-// Run
-main().catch(console.error);
-
-// Keep process alive
-setInterval(() => {}, 1 << 30);
+main();

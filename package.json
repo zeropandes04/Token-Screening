@@ -1,7 +1,7 @@
 {
-  "name": "helius-pump-scanner",
+  "name": "graduation-listener",
   "version": "1.0.0",
-  "description": "Scan for Pump.fun tokens that survived and migrated to Raydium",
+  "description": "Listen for Pump.fun token graduations via PumpPortal WebSocket",
   "main": "index.js",
   "type": "module",
   "scripts": {
@@ -9,7 +9,8 @@
   },
   "dependencies": {
     "dotenv": "^16.3.1",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "ws": "^8.16.0"
   },
   "engines": {
     "node": ">=18.0.0"
