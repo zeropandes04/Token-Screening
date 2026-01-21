@@ -105,69 +105,72 @@ async function getTokenHolders(mint) {
 }
 
 /**
- * Get recent Pump.fun transactions and extract graduated mints
+ * Get recent Pump.fun transactions and extract token mints
  */
 async function getPumpFunGraduations() {
   console.log('📡 Fetching recent Pump.fun transactions...');
-  
-  // Get recent signatures for Pump.fun program
+
   const signatures = await rpcCall('getSignaturesForAddress', [
     PUMP_FUN_PROGRAM,
     { limit: 50 }
   ]);
-  
+
   console.log(`   Found ${signatures.length} recent transactions`);
-  
-  const graduatedMints = [];
+
+  const tokenMints = [];
   const now = Date.now() / 1000;
-  
-  // Process top 20 signatures to find graduations
-  for (const sig of signatures.slice(0, 20)) {
+  const seenMints = new Set();
+
+  for (const sig of signatures.slice(0, 25)) {
     try {
       const tx = await rpcCall('getTransaction', [
         sig.signature,
         { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }
       ]);
-      
-      if (!tx) continue;
-      
-      // Check if this is a graduation/migration transaction
-      const logs = tx.meta?.logMessages || [];
-      const isGraduation = logs.some(log => 
-        log.includes('Program log: Instruction: Withdraw') ||
-        log.includes('complete') ||
-        log.includes('migrate')
-      );
-      
-      if (!isGraduation) continue;
-      
-      // Extract mint from token balances
+
+      if (!tx || !tx.meta) continue;
+
+      // Extract ALL token mints from this transaction
       const postBalances = tx.meta?.postTokenBalances || [];
-      for (const balance of postBalances) {
-        if (balance.mint && balance.mint !== 'So11111111111111111111111111111111111111112') {
-          const age = now - tx.blockTime;
-          const ageMinutes = age / 60;
-          
-          if (ageMinutes >= MIN_AGE_MINUTES) {
-            graduatedMints.push({
-              mint: balance.mint,
-              signature: sig.signature,
-              blockTime: tx.blockTime,
-              ageMinutes: Math.round(ageMinutes)
-            });
-          }
+      const preBalances = tx.meta?.preTokenBalances || [];
+      const allBalances = [...postBalances, ...preBalances];
+
+      for (const balance of allBalances) {
+        const mint = balance.mint;
+
+        // Skip SOL, null, and already seen mints
+        if (!mint ||
+            mint === 'So11111111111111111111111111111111111111112' ||
+            seenMints.has(mint)) {
+          continue;
+        }
+
+        seenMints.add(mint);
+
+        const ageSeconds = now - tx.blockTime;
+        const ageMinutes = ageSeconds / 60;
+
+        // Only include tokens older than MIN_AGE_MINUTES
+        if (ageMinutes >= MIN_AGE_MINUTES) {
+          tokenMints.push({
+            mint: mint,
+            signature: sig.signature,
+            blockTime: tx.blockTime,
+            ageMinutes: Math.round(ageMinutes)
+          });
+          console.log(`   Found: ${mint.slice(0, 8)}... (${Math.round(ageMinutes)} min old)`);
         }
       }
     } catch (error) {
-      console.error(`   Error processing ${sig.signature.slice(0, 8)}...: ${error.message}`);
+      // Skip failed transactions silently
     }
+
+    // Small delay to avoid rate limiting
+    await new Promise(r => setTimeout(r, 100));
   }
-  
-  // Deduplicate by mint
-  const uniqueMints = [...new Map(graduatedMints.map(m => [m.mint, m])).values()];
-  console.log(`   Found ${uniqueMints.length} potential graduations (age >= ${MIN_AGE_MINUTES}min)`);
-  
-  return uniqueMints;
+
+  console.log(`   Total unique mints found: ${tokenMints.length} (age >= ${MIN_AGE_MINUTES}min)`);
+  return tokenMints;
 }
 
 /**
@@ -367,7 +370,10 @@ Configuration:
   
   // Schedule recurring polls
   setInterval(poll, POLL_INTERVAL_MS);
-  
+
+  // Keep process alive
+  process.stdin.resume();
+
   console.log('\n👀 Scanner running. Press Ctrl+C to stop.\n');
 }
 
